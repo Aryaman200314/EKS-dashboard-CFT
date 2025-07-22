@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Create an IAM role for EKS access, attach a read-only policy, and optionally add it to all EKS clusters 
+  with authentication mode set to either API or API_AND_CONFIG_MAP, and assign AmazonEKSClusterAdminPolicy to it.
+
+Parameters:
+  EksClusterRoleName:
+    Type: String
+    Description: Name of the IAM role to be created for EKS access
+
+  SourceAccountId:
+    Type: String
+    Description: AWS Account ID of the application account
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: Must be a valid 12-digit AWS account ID
+
+  EnableAccessEntry:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Set to 'true' to automatically whitelist the IAM role in all EKS clusters with API or API_AND_CONFIG_MAP auth mode.
+
+Conditions:
+  EnableAccessEntryIsTrue: !Equals [ !Ref EnableAccessEntry, 'true' ]
+
+Resources:
+  EksAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: cft-eks-access-policy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EKSReadonlyAccess
+            Effect: Allow
+            Action:
+              - eks:ListClusters
+              - eks:DescribeCluster
+              - eks:ListNodegroups
+              - eks:DescribeNodegroup
+              - eks:ListAddons
+              - eks:DescribeAddon
+              - eks:ListFargateProfiles
+              - cloudwatch:GetMetricData
+              - cloudwatch:GetMetricStatistics
+              - cloudwatch:ListMetrics
+              - sts:GetCallerIdentity
+            Resource: '*'
+
+  EksClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref EksClusterRoleName
+      Description: "EKS access role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${SourceAccountId}:role/Ec2-admin-access-role
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - !Ref EksAccessPolicy
+
+  ClusterAccessLambdaRole:
+    Condition: EnableAccessEntryIsTrue
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowEKSAccessEntryUpdate
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:ListClusters
+                  - eks:DescribeCluster
+                  - eks:CreateAccessEntry
+                  - eks:AssociateAccessPolicy
+                Resource: '*'
+
+  ClusterAccessHandler:
+    Condition: EnableAccessEntryIsTrue
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: EKSAccessEntryUpdater
+      Handler: index.handler
+      Runtime: python3.9
+      Timeout: 60
+      Role: !GetAtt ClusterAccessLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      eks = boto3.client('eks')
+                      clusters = eks.list_clusters()['clusters']
+                      for cluster in clusters:
+                          cluster_info = eks.describe_cluster(name=cluster)['cluster']
+                          auth_mode = cluster_info.get('accessConfig', {}).get('authenticationMode', '')
+
+                          if auth_mode in ['API_AND_CONFIG_MAP', 'API']:
+                              principal_arn = event['ResourceProperties']['RoleArn']
+
+                              eks.create_access_entry(
+                                  clusterName=cluster,
+                                  principalArn=principal_arn,
+                                  type='STANDARD'
+                              )
+
+                              eks.associate_access_policy(
+                                  clusterName=cluster,
+                                  principalArn=principal_arn,
+                                  policyArn='arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy',
+                                  accessScope={
+                                      'type': 'cluster'
+                                  }
+                              )
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Message": str(e)})
+
+  TriggerAccessEntry:
+    Condition: EnableAccessEntryIsTrue
+    Type: Custom::ClusterAccessEntryTrigger
+    Properties:
+      ServiceToken: !GetAtt ClusterAccessHandler.Arn
+      RoleArn: !GetAtt EksClusterRole.Arn
+
+Outputs:
+  EksRoleArn:
+    Description: ARN of the IAM role created for EKS access
+    Value: !GetAtt EksClusterRole.Arn

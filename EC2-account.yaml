@@ -1,0 +1,228 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Launches an EC2 instance for FastAPI EKS admin dashboard using Ubuntu 22.04 (from SSM) in the deployment region.
+  Uses a custom IAM policy for EKS/CloudWatch/STS permissions.  
+  Allows up to two whitelisted IPs for SSH/app (leave second blank if unused).
+  Installs AWS CLI v2 and generates AWS_TARGET_ACCOUNTS_ROLES in .env using a Python script.
+
+Parameters:
+  AccountIds:
+    Type: String
+    Description: Comma-separated AWS Account IDs for app logic (e.g. 123456789012,234567890123)
+
+  AppVisibility:
+    Type: String
+    Default: Private
+    AllowedValues:
+      - Private
+      - Public
+    Description: Passed to the app .env, not used for security group
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 KeyPair for SSH access
+
+  Region:
+    Type: String
+    Default: ap-south-1
+    Description: Comma-separated AWS regions for app logic (e.g. ap-south-1,us-east-1)
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select the VPC for the EC2 instance
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select a Subnet in your chosen VPC
+
+  WhitelistedIp1:
+    Type: String
+    Default: ""
+    Description: Allowed IP/CIDR for SSH and app (leave blank if not used, e.g. 10.0.0.1/32)
+  WhitelistedIp2:
+    Type: String
+    Default: ""
+    Description: Allowed IP/CIDR for SSH and app (leave blank if not used, e.g. 203.0.113.5/32)
+
+Conditions:
+  UseIp1: !Not [!Equals [!Ref WhitelistedIp1, ""]]
+  UseIp2: !Not [!Equals [!Ref WhitelistedIp2, ""]]
+
+Resources:
+  EKSAdminPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: custom-eks-admin-policy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: "sts:AssumeRole"
+            Resource: "*"
+          - Sid: EKSReadonlyAccess
+            Effect: Allow
+            Action:
+              - cloudwatch:GetMetricData
+              - cloudwatch:GetMetricStatistics
+              - cloudwatch:ListMetrics
+              - sts:GetCallerIdentity
+              - eks:*
+            Resource: "*"
+
+  EKSAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: eks-admin-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref EKSAdminPolicy
+
+  EKSAdminInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: eks-admin-instance-profile
+      Roles:
+        - !Ref EKSAdminRole
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and app port from up to two whitelisted IPs
+      VpcId: !Ref VpcId
+
+  SGIngressSSH1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: UseIp1
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref WhitelistedIp1
+
+  SGIngressSSH2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: UseIp2
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref WhitelistedIp2
+
+  SGIngressApp1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: UseIp1
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      CidrIp: !Ref WhitelistedIp1
+
+  SGIngressApp2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: UseIp2
+    Properties:
+      GroupId: !Ref EC2SecurityGroup
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      CidrIp: !Ref WhitelistedIp2
+
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      InstanceId: !Ref EKSAdminInstance
+
+  EKSAdminInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub "{{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id}}"
+      InstanceType: t3a.small
+      KeyName: !Ref KeyPairName
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          GroupSet:
+            - !Ref EC2SecurityGroup
+          SubnetId: !Ref SubnetId
+      IamInstanceProfile: !Ref EKSAdminInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: eks-admin-instance
+        - Key: RegionDeployed
+          Value: !Ref "AWS::Region"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -y
+          sudo apt-get upgrade -y
+          sudo apt-get install -y unzip git python3 python3-pip python3-venv pkg-config libxml2-dev libxmlsec1-dev libxmlsec1-openssl libxslt1-dev python3-dev net-tools
+
+          # Install AWS CLI v2
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          sudo ./aws/install
+
+          cd /home/ubuntu
+          git clone --branch working-final https://github.com/Aryaman200314/EKS-dashboard.git app
+          cd app
+
+          python3 -m venv venv
+          source venv/bin/activate
+
+          pip install --no-binary :all: lxml
+          pip install -r requirements.txt
+
+          echo "ACCOUNT_IDS=${AccountIds}" > .env
+          echo "EKS_ROLE_NAME=EKS-access-role-for-dashboard-custom" >> .env
+          echo "AWS_REGIONS=${Region}" >> .env
+          echo "APP_VISIBILITY=${AppVisibility}" >> .env
+
+          cat << 'EOF' > generate_arns.py
+          import os
+          account_ids = os.environ.get("ACCOUNT_IDS", "")
+          role_name = os.environ.get("EKS_ROLE_NAME", "EKS-access-role-for-dashboard-custom")
+          account_arns = []
+          for acct_id in [x.strip() for x in account_ids.split(",") if x.strip()]:
+              arn = f"arn:aws:iam::{acct_id}:role/{role_name}"
+              account_arns.append(arn)
+          with open(".env", "a") as f:
+              f.write(f"AWS_TARGET_ACCOUNTS_ROLES={','.join(account_arns)}\n")
+          EOF
+
+          export ACCOUNT_IDS="${AccountIds}"
+          export EKS_ROLE_NAME="EKS-access-role-for-dashboard-custom"
+          python3 generate_arns.py
+
+          nohup ./venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000 &
+          sudo chown -R ubuntu:ubuntu /home/ubuntu/app
+
+Outputs:
+  InstanceElasticIp:
+    Description: Elastic IP of the EC2 instance
+    Value: !Ref EIP
+  AppURL:
+    Description: URL to access the app
+    Value: !Sub "http://${EIP}:8000/"
