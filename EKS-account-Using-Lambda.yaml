@@ -1,7 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  Create an IAM role for EKS access, attach a read-only policy, and optionally add it to all EKS clusters 
-  with authentication mode set to either API or API_AND_CONFIG_MAP, and assign AmazonEKSClusterAdminPolicy to it.
+  Launch EKS dashboard app with EKS access IAM role, optional cluster access Lambda, and automatic EC2 deployment.
 
 Parameters:
   EksClusterRoleName:
@@ -20,6 +19,26 @@ Parameters:
     AllowedValues: ['true', 'false']
     Description: >
       Set to 'true' to automatically whitelist the IAM role in all EKS clusters with API or API_AND_CONFIG_MAP auth mode.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for EC2 instance
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet ID for EC2 instance
+
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: AMI ID for EC2 instance (Amazon Linux 2 recommended)
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair
+
+  GitRepoUrl:
+    Type: String
+    Description: Git repository URL for the EKS dashboard app
 
 Conditions:
   EnableAccessEntryIsTrue: !Equals [ !Ref EnableAccessEntry, 'true' ]
@@ -58,12 +77,62 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              AWS: !Sub arn:aws:iam::${SourceAccountId}:role/Ec2-admin-access-role
+              AWS: !Sub arn:aws:iam::${SourceAccountId}:role/
             Action: sts:AssumeRole
       Path: /
       ManagedPolicyArns:
         - !Ref EksAccessPolicy
 
+  # EC2 Instance Profile for IAM Role
+  EksDashboardEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EksClusterRole
+
+  # Security Group for EC2 Instance
+  EksDashboardEC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP access to EKS dashboard app
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # EC2 instance for EKS dashboard app
+  EksDashboardEC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.medium
+      ImageId: !Ref AmiId
+      KeyName: !Ref KeyName
+      SubnetId: !Ref SubnetId
+      IamInstanceProfile: !Ref EksDashboardEC2InstanceProfile
+      SecurityGroupIds:
+        - !Ref EksDashboardEC2SecurityGroup
+      UserData:
+        'Fn::Base64': !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3 git
+          amazon-linux-extras enable python3.8
+          yum install -y python3.8
+          alternatives --set python3 /usr/bin/python3.8
+          python3 -m ensurepip --upgrade
+          pip3 install --upgrade pip
+          cd /opt
+          git clone ${GitRepoUrl} eks-dashboard
+          cd eks-dashboard
+          python3 -m venv venv
+          source venv/bin/activate
+          pip install -r requirements.txt
+          nohup uvicorn app:app --host 0.0.0.0 --port 80 &
+          # Optionally enable at boot (use a systemd service for prod use)
+
+  # Lambda and supporting roles for optional EKS access entry
   ClusterAccessLambdaRole:
     Condition: EnableAccessEntryIsTrue
     Type: AWS::IAM::Role
@@ -86,6 +155,7 @@ Resources:
                 Action:
                   - eks:ListClusters
                   - eks:DescribeCluster
+                  - eks:ListAccessEntries
                   - eks:CreateAccessEntry
                   - eks:AssociateAccessPolicy
                 Resource: '*'
@@ -108,28 +178,32 @@ Resources:
               try:
                   if event['RequestType'] in ['Create', 'Update']:
                       eks = boto3.client('eks')
-                      clusters = eks.list_clusters()['clusters']
+                      clusters = eks.list_clusters().get('clusters', [])
+                      principal_arn = event['ResourceProperties']['RoleArn']
+
                       for cluster in clusters:
                           cluster_info = eks.describe_cluster(name=cluster)['cluster']
                           auth_mode = cluster_info.get('accessConfig', {}).get('authenticationMode', '')
 
                           if auth_mode in ['API_AND_CONFIG_MAP', 'API']:
-                              principal_arn = event['ResourceProperties']['RoleArn']
+                              existing_entries = eks.list_access_entries(clusterName=cluster).get('accessEntries', [])
+                              already_exists = any(e['principalArn'] == principal_arn for e in existing_entries)
 
-                              eks.create_access_entry(
-                                  clusterName=cluster,
-                                  principalArn=principal_arn,
-                                  type='STANDARD'
-                              )
+                              if not already_exists:
+                                  eks.create_access_entry(
+                                      clusterName=cluster,
+                                      principalArn=principal_arn,
+                                      type='STANDARD'
+                                  )
 
-                              eks.associate_access_policy(
-                                  clusterName=cluster,
-                                  principalArn=principal_arn,
-                                  policyArn='arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy',
-                                  accessScope={
-                                      'type': 'cluster'
-                                  }
-                              )
+                                  eks.associate_access_policy(
+                                      clusterName=cluster,
+                                      principalArn=principal_arn,
+                                      policyArn='arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy',
+                                      accessScope={
+                                          'type': 'cluster'
+                                      }
+                                  )
 
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
               except Exception as e:
@@ -147,3 +221,11 @@ Outputs:
   EksRoleArn:
     Description: ARN of the IAM role created for EKS access
     Value: !GetAtt EksClusterRole.Arn
+
+  DashboardInstancePublicDNS:
+    Description: Public DNS of the EC2 instance running the EKS dashboard app
+    Value: !GetAtt EksDashboardEC2.PublicDnsName
+
+  DashboardInstanceId:
+    Description: EC2 InstanceId of the EKS dashboard app server
+    Value: !Ref EksDashboardEC2
